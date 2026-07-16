@@ -193,8 +193,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("sgl_per_tensor_quant_fp8", torch::kXPU, &sgl_per_tensor_quant_fp8);
 
   /*
-   * From fused qk norm rope
+   * From fused qk norm with/out rope
    */
+  m.def(
+      "fused_qk_norm(Tensor! qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, "
+      "float eps, Tensor! q_weight, Tensor! k_weight) -> ()");
+  m.impl("fused_qk_norm", torch::kXPU, &at::native::xpu::fused_qk_norm);
   m.def(
       "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, "
       "float eps, Tensor! q_weight, Tensor! k_weight, float base, bool is_neox, Tensor! position_ids, "
