@@ -115,6 +115,12 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+void fused_q_norm_rope(
+    const torch::Tensor& q_input,
+    torch::Tensor& q_output,
+    const torch::Tensor& freqs_cis,
+    const torch::Tensor& positions,
+    double eps);
 void fused_inplace_qknorm_rope(
     torch::Tensor& q,
     torch::Tensor& k,

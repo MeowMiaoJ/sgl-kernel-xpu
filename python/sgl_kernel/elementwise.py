@@ -187,6 +187,39 @@ def fused_inplace_qknorm_rope(
     )
 
 
+def fused_q_norm_rope(
+    q_input: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float = 1e-6,
+    q_output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Fused RMSNorm+RoPE for DeepSeek-V4 Q path.
+
+    Parameters
+    ----------
+    q_input: torch.Tensor
+        Input Q tensor, shape ``(B, H, D)``.
+    freqs_cis: torch.Tensor
+        RoPE frequency cache, shape ``(max_pos, rope_dim)``.
+    positions: torch.Tensor
+        Position indices, shape ``(B,)``.
+    eps: float
+        Epsilon for RMS normalization.
+    q_output: Optional[torch.Tensor]
+        Optional preallocated output tensor. If omitted, one is allocated.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor with the same shape and dtype as ``q_input``.
+    """
+    if q_output is None:
+        q_output = torch.empty_like(q_input)
+    torch.ops.sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_cis, positions, eps)
+    return q_output
+
+
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
     assert (

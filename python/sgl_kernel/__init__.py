@@ -35,7 +35,6 @@ from sgl_kernel.elementwise import (
     fused_q_norm_rope,
     fused_qk_norm_rope,
     fused_qk_rope,
-    fused_qk_rope_with_cos_sin_cache_inplace,
     gelu_and_mul,
     gelu_tanh_and_mul,
     gemma_fused_add_rmsnorm,
