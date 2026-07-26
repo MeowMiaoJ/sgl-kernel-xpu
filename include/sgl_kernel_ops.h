@@ -121,6 +121,15 @@ void fused_q_norm_rope(
     const torch::Tensor& freqs_cis,
     const torch::Tensor& positions,
     double eps);
+void fused_k_norm_rope_flashmla(
+    const torch::Tensor& kv,
+    const torch::Tensor& kv_weight,
+    const torch::Tensor& freqs_cis,
+    const torch::Tensor& positions,
+    const torch::Tensor& out_loc,
+    torch::Tensor& kvcache,
+    int64_t page_size,
+    double eps);
 void fused_inplace_qknorm_rope(
     torch::Tensor& q,
     torch::Tensor& k,

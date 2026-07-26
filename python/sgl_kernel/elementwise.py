@@ -220,6 +220,51 @@ def fused_q_norm_rope(
     return q_output
 
 
+def fused_k_norm_rope_flashmla(
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+    eps: float = 1e-6,
+) -> None:
+    r"""Fused RMSNorm+RoPE for DeepSeek-V4 K path, encoding directly into a
+    paged FlashMLA KV-cache (fp8 nope + bf16 rope + UE8M0 scales).
+
+    This is an encode/store operator: it has no standalone output tensor and
+    instead writes each token's normalized+roped row directly into
+    ``kvcache`` at the paged slot addressed by ``out_loc``.
+
+    Parameters
+    ----------
+    kv: torch.Tensor
+        Input KV tensor, shape ``(num_tokens, 512)``.
+    kv_weight: torch.Tensor
+        Learned RMSNorm weight, shape ``(512,)``.
+    freqs_cis: torch.Tensor
+        RoPE frequency cache, shape ``(max_pos, 64)``.
+    positions: torch.Tensor
+        Position indices, shape ``(num_tokens,)``, dtype int32.
+    out_loc: torch.Tensor
+        Logical KV-cache slot id per token, shape ``(num_tokens,)``, dtype int32.
+    kvcache: torch.Tensor
+        Paged output buffer, dtype uint8. Modified in-place.
+    page_size: int
+        Tokens per page; must be a power of 2.
+    eps: float
+        Epsilon for RMS normalization.
+
+    Note
+    ----
+    This is an in-place operation that modifies ``kvcache`` directly.
+    """
+    torch.ops.sgl_kernel.fused_k_norm_rope_flashmla(
+        kv, kv_weight, freqs_cis, positions, out_loc, kvcache, page_size, eps
+    )
+
+
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
     assert (

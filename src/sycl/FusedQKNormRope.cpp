@@ -114,6 +114,13 @@ inline void dispatchFusedQKNormRopeHeadDim(int64_t head_dim, const char* kernel_
     case 128:
       fn(std::integral_constant<int64_t, 128>{});
       break;
+    // 192 is needed for the DeepSeek-V4 fused_q_norm_rope path (nope_dim=128 + rope_dim=64).
+    // NUM_REDUCE_STAGES (subgroup size) is 16, so kElemsPerThread = 192/16 = 12 (even), which
+    // keeps every interleaved (real, imag) rope pair inside a single lane's chunk -- see
+    // fused_q_norm_rope below for why that matters.
+    case 192:
+      fn(std::integral_constant<int64_t, 192>{});
+      break;
     case 256:
       fn(std::integral_constant<int64_t, 256>{});
       break;
@@ -949,6 +956,586 @@ void fused_inplace_qknorm_rope(
         }
       });
     });
+  });
+}
+
+// SYCL Kernel for DeepSeek-V4 fused_q_norm_rope: Q-only RMSNorm (no learned
+// weight) + RoPE using a `freqs_cis` table of interleaved (real, imag) pairs
+// (complex-multiply style rotation on adjacent elements), rather than the
+// cos_sin_cache "rotate half" convention used by FusedQKNormRopeCacheKernel
+// above. Because rope pairs are adjacent (2p, 2p+1) and both nope_dim and
+// kElemsPerThread are even for the supported head dims (128, 192), a rope
+// pair can never straddle two lanes' chunks -- so, unlike the neox path
+// above, no subgroup shuffle/permute or barrier is needed here: each lane
+// rotates its own pairs fully locally.
+template <int64_t kHeadDim, typename scalar_t, int64_t kVecSize>
+struct FusedQNormRopeKernel {
+  static_assert(
+      kHeadDim % NUM_REDUCE_STAGES == 0, "head_dim must be divisible by the sub-group size (NUM_REDUCE_STAGES)");
+
+  static constexpr uint32_t kElemsPerThread = static_cast<uint32_t>(kHeadDim / NUM_REDUCE_STAGES);
+  static_assert(kElemsPerThread % kVecSize == 0, "kVecSize must evenly divide kElemsPerThread");
+  static_assert(kElemsPerThread % 2 == 0, "kElemsPerThread must be even for interleaved (real, imag) rope pairs");
+  static constexpr uint32_t kNumChunks = kElemsPerThread / kVecSize;
+
+  const scalar_t* q_ptr;
+  scalar_t* out_ptr;
+  const float* freqs_cis_ptr;  // [max_pos, rope_dim], interleaved (real, imag)
+  const int32_t* positions;    // [num_tokens]
+  int64_t q_token_stride;
+  int64_t q_head_stride;
+  int64_t out_token_stride;
+  int64_t out_head_stride;
+  int64_t rope_dim;
+  int64_t nope_dim;
+  uint32_t num_heads;
+  uint32_t num_tokens;
+  float eps;
+
+  [[sycl::reqd_sub_group_size(NUM_REDUCE_STAGES)]] void operator()(sycl::nd_item<1> item) const {
+    auto sg = item.get_sub_group();
+    const uint32_t lane_id = static_cast<uint32_t>(item.get_local_id(0) % NUM_REDUCE_STAGES);
+    const uint32_t warp_id = static_cast<uint32_t>(item.get_local_id(0) / NUM_REDUCE_STAGES);
+    const uint32_t warps_per_block = static_cast<uint32_t>(item.get_local_range(0) / NUM_REDUCE_STAGES);
+    const uint32_t start_worker_id = static_cast<uint32_t>(item.get_group(0)) * warps_per_block + warp_id;
+    const uint32_t num_workers = static_cast<uint32_t>(item.get_group_range(0)) * warps_per_block;
+
+    const uint32_t num_works = num_heads * num_tokens;
+
+    using VecT = aligned_vector_loop<scalar_t, kVecSize>;
+
+    for (uint32_t idx = start_worker_id; idx < num_works; idx += num_workers) {
+      const uint32_t token_id = idx / num_heads;
+      const uint32_t head_id = idx % num_heads;
+
+      const scalar_t* row_ptr =
+          q_ptr + static_cast<int64_t>(token_id) * q_token_stride + static_cast<int64_t>(head_id) * q_head_stride;
+      scalar_t* out_row_ptr =
+          out_ptr + static_cast<int64_t>(token_id) * out_token_stride + static_cast<int64_t>(head_id) * out_head_stride;
+
+      float elems[kElemsPerThread];
+      float sum_of_squares = 0.0f;
+#pragma unroll
+      for (uint32_t c = 0; c < kNumChunks; ++c) {
+        const VecT in_vec = *reinterpret_cast<const VecT*>(row_ptr + lane_id * kElemsPerThread + c * kVecSize);
+#pragma unroll
+        for (uint32_t v = 0; v < kVecSize; ++v) {
+          const float x = static_cast<float>(in_vec[v]);
+          elems[c * kVecSize + v] = x;
+          sum_of_squares += x * x;
+        }
+      }
+
+      sum_of_squares = subGroupReduceSum(sum_of_squares, sg);
+      const float norm_factor = sycl::rsqrt(sum_of_squares / static_cast<float>(kHeadDim) + eps);
+
+      // Normalize every element first (no learned weight for this op).
+#pragma unroll
+      for (uint32_t i = 0; i < kElemsPerThread; ++i) {
+        elems[i] *= norm_factor;
+      }
+
+      // RoPE: rotate (already-normalized) elements that fall in the tail
+      // rope region, two at a time as (real, imag) pairs. Elements outside
+      // the rope region pass through unchanged.
+      const int64_t pos = static_cast<int64_t>(positions[token_id]);
+      const float* freq_ptr = freqs_cis_ptr + pos * rope_dim;
+      const int64_t lane_base = static_cast<int64_t>(lane_id) * kElemsPerThread;
+
+#pragma unroll
+      for (uint32_t i = 0; i < kElemsPerThread; i += 2) {
+        const int64_t global_idx = lane_base + i;
+        if (global_idx >= nope_dim) {
+          const int64_t p = global_idx - nope_dim;  // pair start within rope region (even)
+          const float fr = freq_ptr[p];
+          const float fi = freq_ptr[p + 1];
+          const float xr = elems[i];
+          const float xi = elems[i + 1];
+          elems[i] = xr * fr - xi * fi;
+          elems[i + 1] = xr * fi + xi * fr;
+        }
+      }
+
+#pragma unroll
+      for (uint32_t c = 0; c < kNumChunks; ++c) {
+        VecT out_vec;
+#pragma unroll
+        for (uint32_t v = 0; v < kVecSize; ++v) {
+          out_vec[v] = static_cast<scalar_t>(elems[c * kVecSize + v]);
+        }
+        *reinterpret_cast<VecT*>(out_row_ptr + lane_id * kElemsPerThread + c * kVecSize) = out_vec;
+      }
+    }
+  }
+};
+
+template <int64_t kHeadDim, typename scalar_t, int64_t kVecSize>
+void launchFusedQNormRopeVecImpl(
+    const scalar_t* q_ptr,
+    scalar_t* out_ptr,
+    const float* freqs_cis_ptr,
+    const int32_t* positions_ptr,
+    int64_t q_token_stride,
+    int64_t q_head_stride,
+    int64_t out_token_stride,
+    int64_t out_head_stride,
+    int64_t num_tokens,
+    int64_t num_heads,
+    int64_t rope_dim,
+    int64_t nope_dim,
+    float eps,
+    sycl::queue& queue,
+    int64_t gridSize,
+    int64_t blockSize) {
+  using KernelT = FusedQNormRopeKernel<kHeadDim, scalar_t, kVecSize>;
+  KernelT kernel{
+      q_ptr,
+      out_ptr,
+      freqs_cis_ptr,
+      positions_ptr,
+      q_token_stride,
+      q_head_stride,
+      out_token_stride,
+      out_head_stride,
+      rope_dim,
+      nope_dim,
+      static_cast<uint32_t>(num_heads),
+      static_cast<uint32_t>(num_tokens),
+      eps};
+
+  sycl_kernel_submit(sycl::range<1>(gridSize * blockSize), sycl::range<1>(blockSize), queue, kernel);
+}
+
+template <int64_t kHeadDim, typename scalar_t>
+void launchFusedQNormRopeImpl(
+    const scalar_t* q_ptr,
+    scalar_t* out_ptr,
+    const float* freqs_cis_ptr,
+    const int32_t* positions_ptr,
+    int64_t q_token_stride,
+    int64_t q_head_stride,
+    int64_t out_token_stride,
+    int64_t out_head_stride,
+    int64_t num_tokens,
+    int64_t num_heads,
+    int64_t rope_dim,
+    float eps,
+    sycl::queue& queue) {
+  const int64_t totalWork = num_tokens * num_heads;
+  const auto launch_cfg = computePersistentLaunchConfig(totalWork, NUM_REDUCE_STAGES);
+
+  constexpr int64_t kElemsPerThread = kHeadDim / NUM_REDUCE_STAGES;
+  const int64_t nope_dim = kHeadDim - rope_dim;
+  const int64_t preferredVecSize = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(scalar_t));
+  const int64_t maxVecSize = std::min<int64_t>(kElemsPerThread, preferredVecSize);
+  const int64_t vec_size = pick_aligned_vec_size(
+      maxVecSize,
+      sizeof(scalar_t),
+      {q_ptr, out_ptr},
+      kElemsPerThread,
+      {q_token_stride, q_head_stride, out_token_stride, out_head_stride});
+
+  dispatchFusedQKNormRopeVecSize<kElemsPerThread>(vec_size, [&](auto vec_size_tag) {
+    constexpr int64_t kVecSize = decltype(vec_size_tag)::value;
+    launchFusedQNormRopeVecImpl<kHeadDim, scalar_t, kVecSize>(
+        q_ptr,
+        out_ptr,
+        freqs_cis_ptr,
+        positions_ptr,
+        q_token_stride,
+        q_head_stride,
+        out_token_stride,
+        out_head_stride,
+        num_tokens,
+        num_heads,
+        rope_dim,
+        nope_dim,
+        eps,
+        queue,
+        launch_cfg.gridSize,
+        launch_cfg.blockSize);
+  });
+}
+
+void fused_q_norm_rope(
+    const torch::Tensor& q_input,
+    torch::Tensor& q_output,
+    const torch::Tensor& freqs_cis,
+    const torch::Tensor& positions,
+    double eps) {
+  TORCH_CHECK(q_input.dim() == 3, "q_input must be 3D: [num_tokens, num_heads, head_dim]");
+  TORCH_CHECK(q_output.dim() == 3, "q_output must be 3D: [num_tokens, num_heads, head_dim]");
+  TORCH_CHECK(q_input.scalar_type() == q_output.scalar_type(), "q_input and q_output must have the same dtype");
+  TORCH_CHECK(freqs_cis.scalar_type() == at::ScalarType::Float, "freqs_cis must be float32");
+  TORCH_CHECK(
+      positions.scalar_type() == at::ScalarType::Int,
+      "positions must have dtype int32 (at::kInt); got ",
+      positions.scalar_type());
+
+  CHECK_DEVICE(q_input);
+  CHECK_DEVICE(q_output);
+  // Only the last dimension (head_dim) needs to be contiguous; q_input/q_output
+  // may be views (e.g. sliced out of a larger packed buffer), so token/head
+  // strides are read directly below instead of being assumed.
+  TORCH_CHECK(q_input.stride(-1) == 1, "q_input must be contiguous in its last dimension (head_dim)");
+  TORCH_CHECK(q_output.stride(-1) == 1, "q_output must be contiguous in its last dimension (head_dim)");
+  CHECK_DEVICE(freqs_cis);
+  CHECK_CONTIGUOUS(freqs_cis);
+  CHECK_DEVICE(positions);
+  CHECK_CONTIGUOUS(positions);
+
+  TORCH_CHECK(
+      q_output.size(0) == q_input.size(0) && q_output.size(1) == q_input.size(1) && q_output.size(2) == q_input.size(2),
+      "q_output shape must match q_input shape");
+
+  const int64_t num_tokens = q_input.size(0);
+  const int64_t num_heads = q_input.size(1);
+  const int64_t head_dim = q_input.size(2);
+  TORCH_CHECK(positions.dim() == 1, "positions must be 1D: [num_tokens]");
+  TORCH_CHECK(positions.size(0) == num_tokens, "positions size must match num_tokens");
+
+  TORCH_CHECK(freqs_cis.dim() == 2, "freqs_cis must be 2D: [max_position, rope_dim]");
+  const int64_t rope_dim = freqs_cis.size(1);
+  TORCH_CHECK(rope_dim > 0 && rope_dim % 2 == 0, "rope_dim must be positive and even");
+  TORCH_CHECK(rope_dim <= head_dim, "rope_dim must be <= head_dim");
+
+  // Current DeepSeek-V4 AOT path only supports these two head dims for the Q
+  // branch (dsv4-flash / dsv4-pro); other head dims aren't part of this op's
+  // contract even though the shared head_dim dispatch below also handles 64/256.
+  TORCH_CHECK(head_dim == 128 || head_dim == 192, "Unsupported head_dim for fused_q_norm_rope: ", head_dim);
+
+  if (num_tokens == 0 || num_heads == 0) {
+    return;
+  }
+
+  auto queue = dpcppGetCurrentQueue();
+
+  dispatchFusedQKNormRopeScalarType<false>(q_input.scalar_type(), "fused_q_norm_rope", [&](auto scalar_tag) {
+    using scalar_t = typename decltype(scalar_tag)::type;
+    dispatchFusedQKNormRopeHeadDim(head_dim, "fused_q_norm_rope", [&](auto head_dim_tag) {
+      constexpr int64_t kHeadDimConst = decltype(head_dim_tag)::value;
+      launchFusedQNormRopeImpl<kHeadDimConst, scalar_t>(
+          static_cast<const scalar_t*>(q_input.data_ptr()),
+          static_cast<scalar_t*>(q_output.data_ptr()),
+          static_cast<const float*>(freqs_cis.data_ptr()),
+          static_cast<const int32_t*>(positions.data_ptr()),
+          q_input.stride(0),
+          q_input.stride(1),
+          q_output.stride(0),
+          q_output.stride(1),
+          num_tokens,
+          num_heads,
+          rope_dim,
+          static_cast<float>(eps),
+          queue);
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// DeepSeek-V4 fused_k_norm_rope_flashmla
+// ---------------------------------------------------------------------------
+//
+// Fixed shape contract (see dsv4_norm_rope_xpu_porting_guide.md): kv is
+// [num_tokens, 512] with a *learned* RMSNorm weight (unlike fused_q_norm_rope
+// above), rope_dim is 64. This is an encode/store op: instead of writing a
+// normal output tensor, each token's normalized+roped row is packed directly
+// into a paged FlashMLA KV-cache buffer as 448 fp8-e4m3 "nope" bytes + 128
+// bf16 "rope" bytes, plus 7 UE8M0 scale bytes (+1 padding byte).
+//
+// Parallel model differs from the Q/QK kernels above: those use one
+// *sub-group* (16 lanes) per (token, head) with a persistent grid-stride
+// loop. Here we use one *work-group* of 8 sub-groups (128 work-items) per
+// token, because a single token's 512-dim row needs a *cross-sub-group*
+// reduction (all 512 elements contribute to one RMSNorm), and because the
+// nope/rope split naturally lines up with sub-group boundaries: with
+// NUM_REDUCE_STAGES == 16 lanes/sub-group and 4 elements/lane, each
+// sub-group covers exactly 64 contiguous elements -- so sub-groups 0..6
+// cover the 448-element nope region 1:1, and sub-group 7 covers the entire
+// 64-element rope region. That's the same "7 nope-warps + 1 rope-warp"
+// split as the CUDA reference (which uses 32-lane warps with 2
+// elements/lane); we use 16-lane sub-groups with 4 elements/lane to reach
+// the same 64-elements-per-subgroup granularity.
+constexpr int64_t kKVHeadDim = 512;
+constexpr int64_t kKVRopeDim = 64;
+constexpr int64_t kKVNopeDim = kKVHeadDim - kKVRopeDim;  // 448
+constexpr int64_t kKVVecSize = 4;
+constexpr int64_t kKVElemsPerSubgroup = NUM_REDUCE_STAGES * kKVVecSize;     // 64
+constexpr int64_t kKVSubgroupsPerToken = kKVHeadDim / kKVElemsPerSubgroup;  // 8
+constexpr int64_t kKVNopeSubgroups = kKVNopeDim / kKVElemsPerSubgroup;      // 7
+constexpr int64_t kKVBlockSize = kKVSubgroupsPerToken * NUM_REDUCE_STAGES;  // 128
+static_assert(kKVNopeDim % kKVElemsPerSubgroup == 0, "nope_dim must split evenly across sub-groups");
+static_assert(kKVSubgroupsPerToken == kKVNopeSubgroups + 1, "expected exactly one rope sub-group");
+
+// FP8 e4m3 UE8M0 quantization constant and scale-byte convention: matches
+// per_token_group_quant_8bit_v2.cpp exactly (amax/448 -> ceil(log2) -> +127
+// bias) so the bytes this kernel writes are readable by the same decode
+// path that consumes that kernel's output.
+constexpr float kFp8E4M3Max = 448.0f;
+
+// Block-per-token analog of computePersistentLaunchConfig above: here the
+// "unit of work" that a single sub-group-of-16 wide notion doesn't apply --
+// a whole 128-work-item work-group is needed per token (for the
+// cross-sub-group RMSNorm reduction), so occupancy is computed at
+// work-group granularity instead of sub-group granularity. Reuses the same
+// device-query primitives (dpcppMaxWorkGroupSize / dpcppMaxWorkItemsPerTile)
+// as computePersistentLaunchConfig, just without its per-sub-group
+// resource-rescaling step, since our block size is fixed.
+inline PersistentLaunchConfig computeBlockPersistentLaunchConfig(int64_t totalTokens, int64_t blockSize) {
+  auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
+  const int64_t maxWgSize = dpcppMaxWorkGroupSize(dev_id);
+  TORCH_CHECK(blockSize <= maxWgSize, "fused_k_norm_rope_flashmla block size exceeds device max work-group size");
+  const int64_t totalResource = std::max<int64_t>(blockSize, dpcppMaxWorkItemsPerTile(dev_id));
+  const int64_t maxResidentBlocks = std::max<int64_t>(1, totalResource / blockSize);
+  const int64_t gridSize = std::max<int64_t>(1, std::min(totalTokens, maxResidentBlocks));
+  return {blockSize, gridSize};
+}
+
+template <typename scalar_t>
+struct FusedKNormRopeFlashMLAKernel {
+  using VecT = aligned_vector_loop<scalar_t, kKVVecSize>;
+
+  const scalar_t* kv_ptr;         // [num_tokens, 512]
+  const scalar_t* kv_weight_ptr;  // [512], learned RMSNorm weight
+  const float* freqs_cis_ptr;     // [max_pos, rope_dim], interleaved (real, imag)
+  const int32_t* positions;       // [num_tokens]
+  const int32_t* out_loc;         // [num_tokens], logical KV-cache slot id
+  uint8_t* kvcache_ptr;           // paged output buffer
+  int64_t kv_token_stride;
+  int64_t page_size;
+  int64_t page_bits;
+  int64_t page_bytes;
+  uint32_t num_tokens;
+  float eps;
+  sycl::local_accessor<float, 1> local_sums;  // cross-sub-group partial sums, size kKVSubgroupsPerToken
+
+  [[sycl::reqd_sub_group_size(NUM_REDUCE_STAGES)]] void operator()(sycl::nd_item<1> item) const {
+    auto sg = item.get_sub_group();
+    const uint32_t lane_id = static_cast<uint32_t>(item.get_local_id(0) % NUM_REDUCE_STAGES);
+    const uint32_t warp_id = static_cast<uint32_t>(item.get_local_id(0) / NUM_REDUCE_STAGES);
+    const uint32_t group_id = static_cast<uint32_t>(item.get_group(0));
+    const uint32_t group_range = static_cast<uint32_t>(item.get_group_range(0));
+    const int64_t elem_base =
+        static_cast<int64_t>(warp_id) * kKVElemsPerSubgroup + static_cast<int64_t>(lane_id) * kKVVecSize;
+
+    for (uint32_t token_id = group_id; token_id < num_tokens; token_id += group_range) {
+      const scalar_t* row_ptr = kv_ptr + static_cast<int64_t>(token_id) * kv_token_stride;
+
+      const VecT in_vec = *reinterpret_cast<const VecT*>(row_ptr + elem_base);
+      const VecT w_vec = *reinterpret_cast<const VecT*>(kv_weight_ptr + elem_base);
+      float elems[kKVVecSize];
+      float sum_sq = 0.0f;
+#pragma unroll
+      for (int v = 0; v < kKVVecSize; ++v) {
+        elems[v] = static_cast<float>(in_vec[v]);
+        sum_sq += elems[v] * elems[v];
+      }
+
+      // Two-level reduction (sub-group reduce, then cross-sub-group reduce
+      // via local memory) -- the same overall shape as norm_group_reduce in
+      // Norm.h, written inline here because that helper is specialized for
+      // sycl::nd_item<3>, while this kernel uses a flat nd_item<1>.
+      const float subgroup_sum = subGroupReduceSum(sum_sq, sg);
+      if (lane_id == 0) {
+        local_sums[warp_id] = subgroup_sum;
+      }
+      sycl::group_barrier(item.get_group());
+
+      float total = 0.0f;
+#pragma unroll
+      for (int i = 0; i < kKVSubgroupsPerToken; ++i) {
+        total += local_sums[i];
+      }
+      const float norm_factor = sycl::rsqrt(total / static_cast<float>(kKVHeadDim) + eps);
+
+      // Normalize with the learned weight (unlike fused_q_norm_rope, which
+      // has no weight at all).
+#pragma unroll
+      for (int v = 0; v < kKVVecSize; ++v) {
+        elems[v] *= norm_factor * static_cast<float>(w_vec[v]);
+      }
+
+      // Paged-cache addressing (see file header comment / porting guide for
+      // the exact layout): every lane recomputes this independently from
+      // out_loc[token_id] -- cheap integer ops, avoids an extra broadcast.
+      const int64_t loc = static_cast<int64_t>(out_loc[token_id]);
+      const int64_t page = loc >> page_bits;
+      const int64_t offset = loc & ((int64_t(1) << page_bits) - 1);
+      uint8_t* page_ptr = kvcache_ptr + page * page_bytes;
+      uint8_t* value_ptr = page_ptr + offset * 576;
+      uint8_t* scale_ptr = page_ptr + 576 * page_size + offset * 8;
+
+      if (warp_id == 0 && lane_id == 0) {
+        scale_ptr[kKVNopeSubgroups] = 0;  // 1 padding byte after the 7 scale bytes
+      }
+
+      if (warp_id < kKVNopeSubgroups) {
+        // Nope sub-groups: fp8 e4m3 quantize this sub-group's 64 elements,
+        // one UE8M0 scale byte per sub-group. Formula matches
+        // per_token_group_quant_8bit_v2.cpp exactly.
+        float local_amax = 1e-10f;
+#pragma unroll
+        for (int v = 0; v < kKVVecSize; ++v) {
+          local_amax = sycl::fmax(local_amax, sycl::fabs(elems[v]));
+        }
+        const float amax = sycl::reduce_over_group(sg, local_amax, sycl::maximum<float>());
+
+        float y_s = amax / kFp8E4M3Max;
+        const float exp_s = sycl::ceil(sycl::log2(sycl::fmax(y_s, 1e-10f)));
+        y_s = sycl::exp2(exp_s);
+        const uint8_t scale_byte = static_cast<uint8_t>(static_cast<int>(exp_s) + 127);
+        const float inv_y_s = 1.0f / y_s;
+
+        for (int v = 0; v < kKVVecSize; ++v) {
+          const float q_val = sycl::fmin(sycl::fmax(elems[v] * inv_y_s, -kFp8E4M3Max), kFp8E4M3Max);
+          const c10::Float8_e4m3fn fp8_val = static_cast<c10::Float8_e4m3fn>(q_val);
+          value_ptr[elem_base + v] = sycl::bit_cast<uint8_t>(fp8_val);
+        }
+        if (lane_id == 0) {
+          scale_ptr[warp_id] = scale_byte;
+        }
+      } else {
+        // Rope sub-group: interleaved (real, imag) rotation, same math as
+        // fused_q_norm_rope's rope path (no learned weight interaction here
+        // since weight was already applied above), then store as bf16.
+        const int64_t pos = static_cast<int64_t>(positions[token_id]);
+        const float* freq_ptr = freqs_cis_ptr + pos * kKVRopeDim;
+        const int64_t lane_rope_base =
+            static_cast<int64_t>(lane_id) * kKVVecSize;  // offset within the 64-elem rope region
+
+#pragma unroll
+        for (int v = 0; v < kKVVecSize; v += 2) {
+          const int64_t p = lane_rope_base + v;
+          const float fr = freq_ptr[p];
+          const float fi = freq_ptr[p + 1];
+          const float xr = elems[v];
+          const float xi = elems[v + 1];
+          elems[v] = xr * fr - xi * fi;
+          elems[v + 1] = xr * fi + xi * fr;
+        }
+
+        const int64_t rope_byte_offset = kKVNopeDim + lane_rope_base * static_cast<int64_t>(sizeof(scalar_t));
+#pragma unroll
+        for (int v = 0; v < kKVVecSize; ++v) {
+          *reinterpret_cast<scalar_t*>(value_ptr + rope_byte_offset + v * static_cast<int64_t>(sizeof(scalar_t))) =
+              static_cast<scalar_t>(elems[v]);
+        }
+      }
+    }
+  }
+};
+
+template <typename scalar_t>
+void launchFusedKNormRopeFlashMLAImpl(
+    const scalar_t* kv_ptr,
+    const scalar_t* kv_weight_ptr,
+    const float* freqs_cis_ptr,
+    const int32_t* positions_ptr,
+    const int32_t* out_loc_ptr,
+    uint8_t* kvcache_ptr,
+    int64_t kv_token_stride,
+    int64_t page_size,
+    int64_t page_bits,
+    int64_t page_bytes,
+    int64_t num_tokens,
+    float eps,
+    sycl::queue& queue) {
+  const auto launch_cfg = computeBlockPersistentLaunchConfig(num_tokens, kKVBlockSize);
+
+  auto cgf = [&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> local_sums(kKVSubgroupsPerToken, cgh);
+    FusedKNormRopeFlashMLAKernel<scalar_t> kernel{
+        kv_ptr,
+        kv_weight_ptr,
+        freqs_cis_ptr,
+        positions_ptr,
+        out_loc_ptr,
+        kvcache_ptr,
+        kv_token_stride,
+        page_size,
+        page_bits,
+        page_bytes,
+        static_cast<uint32_t>(num_tokens),
+        eps,
+        local_sums};
+    cgh.parallel_for<decltype(kernel)>(
+        sycl::nd_range<1>(
+            sycl::range<1>(static_cast<size_t>(launch_cfg.gridSize * launch_cfg.blockSize)),
+            sycl::range<1>(static_cast<size_t>(launch_cfg.blockSize))),
+        kernel);
+  };
+  queue.submit(cgf);
+}
+
+void fused_k_norm_rope_flashmla(
+    const torch::Tensor& kv,
+    const torch::Tensor& kv_weight,
+    const torch::Tensor& freqs_cis,
+    const torch::Tensor& positions,
+    const torch::Tensor& out_loc,
+    torch::Tensor& kvcache,
+    int64_t page_size,
+    double eps) {
+  TORCH_CHECK(kv.dim() == 2, "kv must be 2D: [num_tokens, 512]");
+  TORCH_CHECK(kv.size(1) == kKVHeadDim, "kv last dim must be ", kKVHeadDim, ", got ", kv.size(1));
+  TORCH_CHECK(kv_weight.dim() == 1 && kv_weight.size(0) == kKVHeadDim, "kv_weight must be 1D [", kKVHeadDim, "]");
+  TORCH_CHECK(kv_weight.scalar_type() == kv.scalar_type(), "kv_weight dtype must match kv dtype");
+  TORCH_CHECK(freqs_cis.scalar_type() == at::ScalarType::Float, "freqs_cis must be float32");
+  TORCH_CHECK(
+      freqs_cis.dim() == 2 && freqs_cis.size(1) == kKVRopeDim,
+      "freqs_cis rope_dim must be ",
+      kKVRopeDim,
+      ", got ",
+      freqs_cis.size(1));
+  TORCH_CHECK(
+      positions.scalar_type() == at::ScalarType::Int, "positions must have dtype int32; got ", positions.scalar_type());
+  TORCH_CHECK(
+      out_loc.scalar_type() == at::ScalarType::Int, "out_loc must have dtype int32; got ", out_loc.scalar_type());
+  TORCH_CHECK(kvcache.scalar_type() == at::ScalarType::Byte, "kvcache must be uint8");
+  TORCH_CHECK(page_size > 0 && (page_size & (page_size - 1)) == 0, "page_size must be a power of 2, got ", page_size);
+
+  CHECK_DEVICE(kv);
+  TORCH_CHECK(kv.stride(-1) == 1, "kv must be contiguous in its last dimension");
+  CHECK_DEVICE(kv_weight);
+  CHECK_CONTIGUOUS(kv_weight);
+  CHECK_DEVICE(freqs_cis);
+  CHECK_CONTIGUOUS(freqs_cis);
+  CHECK_DEVICE(positions);
+  CHECK_CONTIGUOUS(positions);
+  CHECK_DEVICE(out_loc);
+  CHECK_CONTIGUOUS(out_loc);
+  CHECK_DEVICE(kvcache);
+  CHECK_CONTIGUOUS(kvcache);
+
+  const int64_t num_tokens = kv.size(0);
+  TORCH_CHECK(positions.dim() == 1 && positions.size(0) == num_tokens, "positions size must match num_tokens");
+  TORCH_CHECK(out_loc.dim() == 1 && out_loc.size(0) == num_tokens, "out_loc size must match num_tokens");
+
+  const int64_t page_bits = static_cast<int64_t>(std::log2(static_cast<double>(page_size)));
+  const int64_t page_bytes = divUp<int64_t>(584 * page_size, 576) * 576;
+
+  if (num_tokens == 0) {
+    return;
+  }
+
+  auto queue = dpcppGetCurrentQueue();
+
+  dispatchFusedQKNormRopeScalarType<false>(kv.scalar_type(), "fused_k_norm_rope_flashmla", [&](auto scalar_tag) {
+    using scalar_t = typename decltype(scalar_tag)::type;
+    launchFusedKNormRopeFlashMLAImpl<scalar_t>(
+        static_cast<const scalar_t*>(kv.data_ptr()),
+        static_cast<const scalar_t*>(kv_weight.data_ptr()),
+        static_cast<const float*>(freqs_cis.data_ptr()),
+        static_cast<const int32_t*>(positions.data_ptr()),
+        static_cast<const int32_t*>(out_loc.data_ptr()),
+        static_cast<uint8_t*>(kvcache.data_ptr()),
+        kv.stride(0),
+        page_size,
+        page_bits,
+        page_bytes,
+        num_tokens,
+        static_cast<float>(eps),
+        queue);
   });
 }
 

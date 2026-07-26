@@ -742,6 +742,144 @@ def make_cache_inputs(
     return q, k, q_weight, k_weight, cos_sin_cache, positions
 
 
+# ---------------------------------------------------------------------------
+# DeepSeek-V4 fused_q_norm_rope / fused_k_norm_rope_flashmla latency check
+# ---------------------------------------------------------------------------
+#
+# Simple (non-triton.testing.Benchmark) latency comparison, per the porting
+# guide: shapes match the actual dsv4-flash/dsv4-pro model config --
+# q: [T, 64, 192] (nope_dim=128, rope_dim=64), kv: [T, 512] (rope_dim=64).
+# fused_q_norm_rope is compared against fused_qk_norm_rope configured with an
+# equivalent Q-only workload (same head_dim=192, same rotary_dim=64) since
+# the latter is the closest existing, already-benchmarked op with a similar
+# per-(token,head) compute pattern; fused_k_norm_rope_flashmla has no
+# directly equivalent existing op, so its latency is reported standalone.
+DSV4_NUM_TOKENS = [1, 16, 128, 512, 2048, 8192]
+DSV4_NUM_Q_HEADS = 64
+DSV4_HEAD_DIM = 192
+DSV4_KV_HEAD_DIM = 512
+DSV4_ROPE_DIM = 64
+DSV4_PAGE_SIZE = 64
+# fused_qk_norm_rope (the legacy per-lane-chunk kernel used here only as a
+# comparison baseline) requires rotary_dim % (head_dim / NUM_REDUCE_STAGES) == 0,
+# and (for is_neox=True) additionally requires half_rotary_lanes
+# (= rotary_dim / numElemsPerThread / 2) to be a power of 2. At head_dim=192,
+# NUM_REDUCE_STAGES=16 -> numElemsPerThread=12, and the real rope_dim=64
+# satisfies neither constraint (this op has no such constraints; they're
+# specific to fused_qk_norm_rope's whole-lane rotation gating). The valid
+# rotary_dim values under both constraints are {24, 48, 96, 192}; use the
+# closest one to 64 (48) for the baseline only.
+DSV4_QK_BASELINE_ROTARY_DIM = 48
+
+
+def _bench_ms(fn) -> float:
+    ms, _, _ = triton.testing.do_bench(fn, quantiles=[0.5, 0.2, 0.8])
+    return ms
+
+
+def run_dsv4_norm_rope_benchmark():
+    device = torch.device("xpu")
+    dtype = torch.bfloat16
+    eps = 1e-6
+    max_pos = max(DSV4_NUM_TOKENS) + 1
+
+    rows = []
+    for num_tokens in DSV4_NUM_TOKENS:
+        positions = torch.arange(num_tokens, device=device, dtype=torch.int32)
+
+        # fused_q_norm_rope: q [T, 64, 192], freqs_cis [max_pos, 64]
+        q_input = torch.randn(
+            num_tokens, DSV4_NUM_Q_HEADS, DSV4_HEAD_DIM, dtype=dtype, device=device
+        )
+        freqs_cis = torch.randn(
+            max_pos, DSV4_ROPE_DIM, dtype=torch.float32, device=device
+        )
+        q_ms = _bench_ms(
+            lambda: sgl_kernel.fused_q_norm_rope(q_input, freqs_cis, positions, eps)
+        )
+
+        # fused_qk_norm_rope baseline: same head_dim, Q-only heads
+        # (num_heads_k = num_heads_v = 0) packed into a qkv tensor. Uses
+        # DSV4_QK_BASELINE_ROTARY_DIM (not DSV4_ROPE_DIM) -- see comment above
+        # on why 64 isn't a valid rotary_dim for this specific kernel at
+        # head_dim=192.
+        qkv = torch.randn(
+            num_tokens, DSV4_NUM_Q_HEADS * DSV4_HEAD_DIM, dtype=dtype, device=device
+        )
+        q_weight = torch.randn(DSV4_HEAD_DIM, dtype=dtype, device=device)
+        k_weight = torch.randn(DSV4_HEAD_DIM, dtype=dtype, device=device)
+        qk_ms = _bench_ms(
+            lambda: sgl_kernel.fused_qk_norm_rope(
+                qkv.clone(),
+                DSV4_NUM_Q_HEADS,
+                0,
+                0,
+                DSV4_HEAD_DIM,
+                eps,
+                q_weight,
+                k_weight,
+                10000.0,
+                True,
+                positions,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                DSV4_QK_BASELINE_ROTARY_DIM,
+            )
+        )
+
+        # fused_k_norm_rope_flashmla: kv [T, 512], standalone (no equivalent
+        # existing op to compare against).
+        kv = torch.randn(num_tokens, DSV4_KV_HEAD_DIM, dtype=dtype, device=device)
+        kv_weight = torch.randn(DSV4_KV_HEAD_DIM, dtype=dtype, device=device)
+        kv_freqs_cis = torch.randn(
+            max_pos, DSV4_ROPE_DIM, dtype=torch.float32, device=device
+        )
+        out_loc = torch.arange(num_tokens, device=device, dtype=torch.int32)
+        num_pages = num_tokens // DSV4_PAGE_SIZE + 2
+        page_bytes = ((584 * DSV4_PAGE_SIZE + 575) // 576) * 576
+        kvcache = torch.zeros(num_pages * page_bytes, dtype=torch.uint8, device=device)
+        k_ms = _bench_ms(
+            lambda: sgl_kernel.fused_k_norm_rope_flashmla(
+                kv,
+                kv_weight,
+                kv_freqs_cis,
+                positions,
+                out_loc,
+                kvcache,
+                DSV4_PAGE_SIZE,
+                eps,
+            )
+        )
+
+        rows.append(
+            {
+                "num_tokens": num_tokens,
+                "fused_q_norm_rope_us": round(q_ms * 1000, 2),
+                "fused_qk_norm_rope_baseline_us": round(qk_ms * 1000, 2),
+                "q_vs_qk_ratio": round(q_ms / qk_ms, 3),
+                "fused_k_norm_rope_flashmla_us": round(k_ms * 1000, 2),
+            }
+        )
+
+    print("\n" + "=" * 80)
+    print("DeepSeek-V4 fused_q_norm_rope / fused_k_norm_rope_flashmla latency")
+    print("=" * 80)
+    header = (
+        f"{'num_tokens':>10} | {'q_norm_rope(us)':>16} | {'qk_baseline(us)':>16} | "
+        f"{'q/qk ratio':>10} | {'k_flashmla(us)':>16}"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        print(
+            f"{row['num_tokens']:>10} | {row['fused_q_norm_rope_us']:>16} | "
+            f"{row['fused_qk_norm_rope_baseline_us']:>16} | {row['q_vs_qk_ratio']:>10} | "
+            f"{row['fused_k_norm_rope_flashmla_us']:>16}"
+        )
+
+
 if __name__ == "__main__":
     print("Running benchmarks...")
     benchmark.run(print_data=True)
@@ -773,6 +911,8 @@ if __name__ == "__main__":
     df["gflops"] = df["gflops"].round(2)
 
     print(df.to_markdown(index=False))
+
+    # run_dsv4_norm_rope_benchmark()
 
     # Print summary statistics per provider
     print("\n" + "=" * 80)
